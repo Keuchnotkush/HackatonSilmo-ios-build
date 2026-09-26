@@ -12,6 +12,10 @@ everything sensitive is stored as an Actions secret.
 `ios`). After Apple finishes processing the upload (about 5-15 minutes), install the
 build from the TestFlight app on your iPhone.
 
+Tick **check_only** to compile the Kotlin iOS code only (about 6 minutes, no Apple secrets,
+no signing, no upload, no build number used). It is the quick way to catch iOS compile
+errors from Linux or Windows before a real build.
+
 ## Secrets (Settings → Secrets and variables → Actions)
 
 | Secret | What it is |

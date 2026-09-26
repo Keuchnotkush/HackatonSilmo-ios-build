@@ -16,6 +16,10 @@ on:
         description: Branch, tag or commit of youkill081/HackatonSilmo to build
         default: ios
         required: true
+      check_only:
+        description: Only compile the Kotlin iOS code (about 6 min, no signing, no TestFlight upload)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,7 +29,42 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Fast feedback while porting code: catches Kotlin/Native errors without Apple secrets or a build number.
+  check:
+    if: ${{ inputs.check_only }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Check out app source (private, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: youkill081/HackatonSilmo
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Cache Kotlin/Native toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('kmp/build.gradle.kts', 'kmp/settings.gradle.kts') }}
+
+      - name: Compile Kotlin for iOS
+        env:
+          # Read by kmp/settings.gradle.kts to download the SDK from GitHub Packages.
+          GITHUB_TOKEN: ${{ secrets.GPR_TOKEN }}
+        working-directory: kmp
+        run: ./gradlew --no-daemon :composeApp:compileKotlinIosArm64
+
   testflight:
+    if: ${{ !inputs.check_only }}
     # Apple only accepts uploads built with the current major iOS SDK (Xcode 26 since April 2026).
     runs-on: macos-26
     timeout-minutes: 60

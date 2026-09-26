@@ -1,0 +1,121 @@
+# Builds the private youkill081/HackatonSilmo KMP app for iOS and uploads it to TestFlight.
+#
+# This repo is public on purpose (free macOS minutes) and holds no app code: the source is
+# checked out at build time with a read-only deploy key. Everything sensitive lives in
+# Actions secrets. Rules that keep it that way:
+#   - manual trigger only: workflow_dispatch can only be run by people with write access,
+#     and fork pull requests never see secrets;
+#   - no upload-artifact step: the .ipa bundles sdk.key and anyone can download public artifacts;
+#   - no step prints a secret, decoded or not (logs are public).
+name: iOS → TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of youkill081/HackatonSilmo to build
+        default: ios
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    # Apple only accepts uploads built with the current major iOS SDK (Xcode 26 since April 2026).
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      SOURCE_REPO: youkill081/HackatonSilmo
+      PROJECT: kmp/iosApp/HackatonSilmo.xcodeproj
+      SCHEME: HackatonSilmo
+    steps:
+      - name: Check out app source (private, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Cache Kotlin/Native toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('kmp/build.gradle.kts', 'kmp/settings.gradle.kts') }}
+
+      - name: Install secrets into the build
+        env:
+          SDK_KEY_B64: ${{ secrets.SDK_KEY_B64 }}
+          ASC_KEY_P8_B64: ${{ secrets.ASC_KEY_P8_B64 }}
+        run: |
+          printf '%s' "$SDK_KEY_B64" | base64 --decode > kmp/iosApp/HackatonSilmo/sdk.key
+          printf '%s' "$ASC_KEY_P8_B64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          chmod 600 kmp/iosApp/HackatonSilmo/sdk.key "$RUNNER_TEMP/AuthKey.p8"
+          test -s kmp/iosApp/HackatonSilmo/sdk.key || { echo "::error::SDK_KEY_B64 secret is missing or empty"; exit 1; }
+          test -s "$RUNNER_TEMP/AuthKey.p8"        || { echo "::error::ASC_KEY_P8_B64 secret is missing or empty"; exit 1; }
+          xcodebuild -version
+
+      - name: Archive (Kotlin framework + app, cloud-managed signing)
+        env:
+          # Read by kmp/settings.gradle.kts to download the SDK from GitHub Packages.
+          GITHUB_TOKEN: ${{ secrets.GPR_TOKEN }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          xcodebuild archive \
+            -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}"
+
+      - name: Export and upload to TestFlight
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          echo "Uploaded build ${{ github.run_number }}. It appears in TestFlight after Apple's processing (5-15 min)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove secrets from the runner
+        if: always()
+        run: rm -rf kmp/iosApp/HackatonSilmo/sdk.key "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/app.xcarchive" "$RUNNER_TEMP/export"
